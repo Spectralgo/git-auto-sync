@@ -1,38 +1,45 @@
-name: goreleaser
+name: Release reviewed build
 
 on:
-  push:
-    tags:
-      - "*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing reviewed tag to package
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
-  goreleaser:
+  release:
     runs-on: macos-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
-      - name: Set up Go
-        uses: actions/setup-go@v2
+      - uses: actions/setup-go@v5
         with:
-          go-version: 1.18
-      - name: Install Snapcraft
-        uses: samuelmeuli/action-snapcraft@v1
-      - name: snapcraft-login
-        env:
-          SNAPCRAFT_LOGIN: ${{ secrets.SNAPCRAFT_LOGIN }}
+          go-version-file: go.mod
+      - name: Verify source and package Apple Silicon binary
         run: |
-          snapcraft login --with <(echo "$SNAPCRAFT_LOGIN" | base64 -d)
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v2
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          distribution: goreleaser
-          version: latest
-          args: release --rm-dist
+          go test ./...
+          go vet ./...
+          mkdir -p dist
+          revision=$(git rev-parse HEAD)
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build -trimpath -ldflags "-X main.version=$revision" -o dist/git-auto-sync-darwin-arm64 .
+          cd dist
+          shasum -a 256 git-auto-sync-darwin-arm64 > SHA256SUMS
+      - name: Publish a candidate in this fork
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-          SNAPCRAFT_LOGIN: ${{ secrets.SNAPCRAFT_LOGIN }}
-          FURY_TOKEN: ${{ secrets.FURY_PUSH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Existing assets are never replaced: published checksums stay valid.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/git-auto-sync-darwin-arm64 dist/SHA256SUMS
+          else
+            gh release create "$RELEASE_TAG" --prerelease --title "$RELEASE_TAG" --generate-notes dist/git-auto-sync-darwin-arm64 dist/SHA256SUMS
+          fi

@@ -2,11 +2,13 @@ package common
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ztrue/tracerr"
 	git "gopkg.in/src-d/go-git.v4"
@@ -77,56 +79,59 @@ func commit(repoConfig RepoConfig) error {
 }
 
 func GitCommand(repoConfig RepoConfig, args []string) (bytes.Buffer, error) {
-	repoPath := repoConfig.RepoPath
-
-	var outb, errb bytes.Buffer
-
-	cmd := "git"
+	var outb bytes.Buffer
+	gitExec := "git"
 	if repoConfig.GitExec != "" {
-		cmd = repoConfig.GitExec
+		gitExec = repoConfig.GitExec
 	}
-
-	statusCmd := exec.Command(cmd, args...)
-	statusCmd.Dir = repoPath
+	timeout := repoConfig.CommandTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	parent := repoConfig.Context
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	statusCmd := exec.CommandContext(ctx, gitExec, args...)
+	configureGitProcess(statusCmd)
+	statusCmd.WaitDelay = 2 * time.Second
+	statusCmd.Dir = repoConfig.RepoPath
 	statusCmd.Stdout = &outb
-	statusCmd.Stderr = &errb
+	// Do not echo Git output on failure: remote URLs, hooks and credential
+	// helpers can print secrets. The operation and exit status are sufficient.
 	statusCmd.Env = toEnvString(repoConfig)
 	err := statusCmd.Run()
-
-	if hasEnvVariable(os.Environ(), "SSH_AUTH_SOCK") && !hasEnvVariable(repoConfig.Env, "SSH_AUTH_SOCK") {
-		fmt.Println("WARNING: SSH_AUTH_SOCK env variable isn't being passed")
-	}
-
 	if err != nil {
-		fullCmd := "git " + strings.Join(args, " ")
-		err := tracerr.Errorf("%w: Command: %s\nEnv: %s\nStdOut: %s\nStdErr: %s", err, fullCmd, statusCmd.Env, outb.String(), errb.String())
-		return outb, err
+		operation := "command"
+		if len(args) > 0 {
+			operation = args[0]
+		}
+		if ctx.Err() != nil {
+			return outb, fmt.Errorf("git %s interrupted: %w", operation, ctx.Err())
+		}
+		return outb, fmt.Errorf("git %s failed: %w", operation, err)
 	}
 	return outb, nil
 }
 
 func toEnvString(repoConfig RepoConfig) []string {
-	vals := repoConfig.Env
+	vals := append([]string{}, os.Environ()...)
 	vals = append(vals, repoConfig.Env...)
-
-	for _, s := range os.Environ() {
-		parts := strings.Split(s, "=")
-		k := parts[0]
-		if k == "HOME" {
-			vals = append(vals, s)
+	// A process launched by a Git hook can inherit repository selectors. The
+	// explicit checkout path must remain authoritative; preserve authentication
+	// and other environment while dropping selectors for another worktree/index.
+	filtered := make([]string, 0, len(vals))
+	for _, entry := range vals {
+		key, _, _ := strings.Cut(entry, "=")
+		switch key {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES":
+			continue
 		}
+		filtered = append(filtered, entry)
 	}
-
+	vals = filtered
+	vals = append(vals, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_EDITOR=true", "GIT_SEQUENCE_EDITOR=true", "GIT_MERGE_AUTOEDIT=no")
 	return vals
-}
-
-func hasEnvVariable(all []string, name string) bool {
-	for _, s := range all {
-		parts := strings.Split(s, "=")
-		k := parts[0]
-		if k == name {
-			return true
-		}
-	}
-	return false
 }

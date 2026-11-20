@@ -4,16 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/GitJournal/git-auto-sync/common"
-	cfg "github.com/GitJournal/git-auto-sync/common/config"
+	"github.com/Spectralgo/git-auto-sync/common"
+	cfg "github.com/Spectralgo/git-auto-sync/common/config"
 	cli "github.com/urfave/cli/v2"
 	"github.com/ztrue/tracerr"
 	"golang.org/x/exp/slices"
-	git "gopkg.in/src-d/go-git.v4"
 )
 
 var errRepoPathInvalid = errors.New("Not a valid git repo")
@@ -98,40 +96,11 @@ func daemonAdd(ctx *cli.Context) error {
 }
 
 func isValidGitRepo(repoPath string) (string, error) {
-	info, err := os.Stat(repoPath)
-	if os.IsNotExist(err) {
-		return "", tracerr.Errorf("%w - %s", errRepoPathInvalid, repoPath)
-	}
-
-	if !info.IsDir() {
-		return "", tracerr.Errorf("%w - %s", errRepoPathInvalid, repoPath)
-	}
-
-	_, err = git.PlainOpenWithOptions(repoPath, &git.PlainOpenOptions{DetectDotGit: true})
+	out, err := common.GitCommand(common.RepoConfig{RepoPath: repoPath}, []string{"rev-parse", "--show-toplevel"})
 	if err != nil {
-		return "", tracerr.Errorf("Not a valid git repo - %s\n%w", repoPath, err)
+		return "", fmt.Errorf("%w: %s: %w", errRepoPathInvalid, repoPath, err)
 	}
-
-	for {
-		info, err := os.Stat(filepath.Join(repoPath, ".git"))
-		if err != nil {
-			if !os.IsNotExist(err) {
-				return "", tracerr.Errorf("%w - %s", errRepoPathInvalid, repoPath)
-			}
-		}
-
-		if os.IsNotExist(err) {
-			repoPath = filepath.Dir(repoPath)
-			continue
-		}
-
-		if !info.IsDir() {
-			return "", tracerr.Errorf("%w - %s", errRepoPathInvalid, repoPath)
-		}
-		break
-	}
-
-	return repoPath, nil
+	return strings.TrimSpace(out.String()), nil
 }
 
 func daemonRm(ctx *cli.Context) error {

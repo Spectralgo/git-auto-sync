@@ -1,19 +1,27 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
-	"github.com/GitJournal/git-auto-sync/common"
-	cfg "github.com/GitJournal/git-auto-sync/common/config"
+	"github.com/Spectralgo/git-auto-sync/common"
+	cfg "github.com/Spectralgo/git-auto-sync/common/config"
 	"github.com/kardianos/service"
 )
 
-type Daemon struct{}
+type Daemon struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+}
 
 func (d *Daemon) Start(s service.Service) error {
-	go d.run()
+	d.ctx, d.cancel = context.WithCancel(context.Background())
+	d.done = make(chan struct{})
+	go func() { d.run(); close(d.done) }()
 	return nil
 }
 
@@ -29,15 +37,23 @@ func (d *Daemon) run() {
 		wg.Add(1)
 
 		fmt.Println("Monitoring", repoPath)
-		go watchForChanges(&wg, repoPath)
+		go watchForChangesContext(d.ctx, &wg, repoPath)
 	}
 
 	wg.Wait()
 }
 
 func (d *Daemon) Stop(s service.Service) error {
-	// Stop should not block. Return with a few seconds.
-	return nil
+	if d.cancel == nil {
+		return nil
+	}
+	d.cancel()
+	select {
+	case <-d.done:
+		return nil
+	case <-time.After(8 * time.Second):
+		return fmt.Errorf("timed out waiting for active sync cleanup")
+	}
 }
 
 func main() {
@@ -59,16 +75,20 @@ func main() {
 	}
 }
 
-// FIXME: pass some kind of channel which tells this when to close!
 func watchForChanges(wg *sync.WaitGroup, repoPath string) {
+	watchForChangesContext(context.Background(), wg, repoPath)
+}
+
+func watchForChangesContext(ctx context.Context, wg *sync.WaitGroup, repoPath string) {
 	defer wg.Done()
 
 	cfg, err := common.NewRepoConfig(repoPath)
 	if err != nil {
 		log.Println(err)
+		return
 	}
 
-	err = common.WatchForChanges(cfg)
+	err = common.WatchForChangesContext(ctx, cfg)
 	if err != nil {
 		log.Println(err)
 	}

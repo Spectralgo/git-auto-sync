@@ -1,25 +1,29 @@
 package common
 
 import (
+	"context"
+	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rjeczalik/notify"
 	"github.com/ztrue/tracerr"
-	git "gopkg.in/src-d/go-git.v4"
 )
 
-// FIXME: Replace the logger with returning an error and retrying after 'x' minutes
-
 type RepoConfig struct {
-	RepoPath     string
-	PollInterval time.Duration
-	FSLag        time.Duration
-	GitExec      string
-	Env          []string
+	Context        context.Context
+	RepoPath       string
+	PollInterval   time.Duration
+	FSLag          time.Duration
+	GitExec        string
+	Env            []string
+	Remote         string
+	Branch         string
+	Strategy       string
+	CommandTimeout time.Duration
 }
 
 type AwakeNotifier interface {
@@ -27,118 +31,166 @@ type AwakeNotifier interface {
 }
 
 func NewRepoConfig(repoPath string) (RepoConfig, error) {
-	repo, err := git.PlainOpen(repoPath)
+	r, err := openSyncRepo(RepoConfig{RepoPath: repoPath})
 	if err != nil {
-		return RepoConfig{}, tracerr.Wrap(err)
+		return RepoConfig{}, err
 	}
-
-	config, err := repo.Config()
-	if err != nil {
-		return RepoConfig{}, tracerr.Wrap(err)
-	}
-
-	autoSyncSection := config.Raw.Section("auto-sync")
-
-	pollInterval := 10 * time.Minute
-	if autoSyncSection.Option("syncInterval") != "" {
-		secondsStr := autoSyncSection.Option("syncInterval")
+	cfg := r.cfg
+	cfg.PollInterval = 10 * time.Minute
+	cfg.FSLag = time.Second
+	cfg.Strategy = "merge"
+	secondsStr, err := r.git("config", "--get", "auto-sync.syncInterval")
+	if err == nil && secondsStr != "" {
 		seconds, err := strconv.Atoi(secondsStr)
-		if err != nil {
-			return RepoConfig{}, tracerr.Wrap(err)
+		if err != nil || seconds <= 0 {
+			return RepoConfig{}, fmt.Errorf("auto-sync.syncInterval must be positive seconds")
 		}
-
-		pollInterval = time.Duration(seconds) * time.Second
+		cfg.PollInterval = time.Duration(seconds) * time.Second
 	}
-
-	gitExec := ""
-	if autoSyncSection.Option("exec") != "" {
-		gitExec = autoSyncSection.Option("exec")
-
-		_, err := os.Stat(gitExec)
-		if err != nil {
-			return RepoConfig{}, tracerr.Wrap(err)
-		}
+	// Pin the branch and remote at watcher startup. A later branch switch must
+	// fail validation rather than publish an unrelated checkout.
+	cfg.Branch, _ = r.git("symbolic-ref", "--quiet", "--short", "HEAD")
+	if cfg.Branch != "" {
+		cfg.Remote, _ = r.git("config", "--get", "branch."+cfg.Branch+".remote")
 	}
-
-	return RepoConfig{
-		RepoPath:     repoPath,
-		PollInterval: pollInterval,
-		FSLag:        1 * time.Second,
-		GitExec:      gitExec,
-	}, nil
+	return cfg, nil
 }
 
+// WatchForChanges uses the same lock and status as manual sync. Transient
+// failures are recorded by Sync and retried without stopping the watcher.
 func WatchForChanges(cfg RepoConfig) error {
-	repoPath := cfg.RepoPath
-	var err error
-
-	err = AutoSync(cfg)
-	if err != nil {
-		return tracerr.Wrap(err)
+	ctx := cfg.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	return WatchForChangesContext(ctx, cfg)
+}
 
-	notifyFilteredChannel := make(chan bool, 100)
-	pollTicker := time.NewTicker(cfg.PollInterval)
-
-	// Filtered events
-	go func() {
-		notifier, err := NewAwakeNotifier()
-		if err != nil {
-			log.Fatalln(err)
-		}
-
-		err = notifier.Start(notifyFilteredChannel)
-		if err != nil {
-			log.Fatalln(err)
-		}
-
-		for {
-			select {
-			case <-notifyFilteredChannel:
-				// Wait 1 second
-				timer1 := time.NewTimer(cfg.FSLag)
-				done := make(chan bool)
-				go func() {
-					<-timer1.C
-					done <- true
-				}()
-
-				err := AutoSync(cfg)
-				if err != nil {
-					log.Fatalln(err)
-				}
-				continue
-
-			case <-pollTicker.C:
-				err := AutoSync(cfg)
-				if err != nil {
-					log.Fatalln(err)
-				}
-			}
-		}
-	}()
-
-	//
-	// Watch for FS events
-	//
+func WatchForChangesContext(ctx context.Context, cfg RepoConfig) error {
+	cfg.Context = ctx
 	notifyChannel := make(chan notify.EventInfo, 100)
-
-	err = notify.Watch(filepath.Join(repoPath, "..."), notifyChannel, notify.Write, notify.Rename, notify.Remove, notify.Create)
-	if err != nil {
+	if err := notify.Watch(filepath.Join(cfg.RepoPath, "..."), notifyChannel, notify.Write, notify.Rename, notify.Remove, notify.Create); err != nil {
 		return tracerr.Wrap(err)
 	}
 	defer notify.Stop(notifyChannel)
-
+	events := make(chan bool, 100)
+	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	notifier, err := NewAwakeNotifier()
+	if err != nil {
+		log.Printf("awake notifier unavailable: %v", err)
+	} else if err = notifier.Start(events); err != nil {
+		log.Printf("awake notifier unavailable: %v", err)
+	}
+	done := make(chan struct{})
+	go func() { runWatchLoop(watchCtx, cfg, events, AutoSync); close(done) }()
+	defer func() { cancel(); <-done }()
 	for {
-		ei := <-notifyChannel
-		ignore, err := ShouldIgnoreFile(repoPath, ei.Path())
-		if err != nil {
-			return tracerr.Wrap(err)
+		select {
+		case <-ctx.Done():
+			return nil
+		case event := <-notifyChannel:
+			if event == nil {
+				continue
+			}
+			relative, err := filepath.Rel(cfg.RepoPath, event.Path())
+			// Ignore Git metadata, including our permanent lock/status files.
+			// Git itself handles ignored files; all other events debounce.
+			if err != nil || relative == ".git" || strings.HasPrefix(relative, ".git"+string(filepath.Separator)) {
+				continue
+			}
+			select {
+			case events <- true:
+			default:
+			}
 		}
-		if ignore {
-			continue
-		}
+	}
+}
 
-		notifyFilteredChannel <- true
+// runWatchLoop serializes sync attempts and resets its timer for each write.
+// Failed attempts retry at 1, 2, 4 ... 60 seconds; a successful attempt resets
+// the backoff. Polling still checks for remote-only changes.
+func runWatchLoop(ctx context.Context, cfg RepoConfig, events <-chan bool, syncFn func(RepoConfig) error) {
+	poll := cfg.PollInterval
+	if poll <= 0 {
+		poll = 10 * time.Minute
+	}
+	lag := cfg.FSLag
+	if lag <= 0 {
+		lag = time.Second
+	}
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	var next <-chan time.Time
+	backoff := time.Second
+	schedule := func(delay time.Duration) {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(delay)
+		next = timer.C
+	}
+	perform := func() {
+		next = nil
+		if err := syncFn(cfg); err != nil {
+			log.Printf("sync failed for %s: %v; retrying in %s", cfg.RepoPath, err, backoff)
+			schedule(backoff)
+			backoff *= 2
+			if backoff > time.Minute {
+				backoff = time.Minute
+			}
+		} else {
+			backoff = time.Second
+		}
+	}
+	consumePendingWrites := func() bool {
+		pending := false
+		for {
+			select {
+			case _, ok := <-events:
+				if !ok {
+					events = nil
+					return pending
+				}
+				pending = true
+			default:
+				return pending
+			}
+		}
+	}
+	perform()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-events:
+			if !ok {
+				events = nil
+				continue
+			}
+			schedule(lag)
+		case <-ticker.C:
+			// A remote poll must not bypass an active write debounce or a
+			// scheduled retry. That timer owns the next safe sync boundary.
+			if consumePendingWrites() {
+				schedule(lag)
+			} else if next == nil {
+				perform()
+			}
+		case <-next:
+			if consumePendingWrites() {
+				schedule(lag)
+			} else {
+				perform()
+			}
+		}
 	}
 }
