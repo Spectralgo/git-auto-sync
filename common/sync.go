@@ -2,6 +2,7 @@ package common
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,21 +18,23 @@ import (
 // SyncResult describes the checkout and the last observed upstream. Status is
 // local/read-only; only a successful Sync verifies publication to the server.
 type SyncResult struct {
-	State       string `json:"state"`
-	Head        string `json:"head"`
-	RemoteHead  string `json:"remote_head"`
-	Ahead       int    `json:"ahead"`
-	Behind      int    `json:"behind"`
-	LastSuccess string `json:"last_success"`
-	Error       string `json:"error"`
-	Remote      string `json:"remote"`
-	Branch      string `json:"branch"`
-	UpdatedAt   string `json:"updated_at"`
+	State          string `json:"state"`
+	Head           string `json:"head"`
+	RemoteHead     string `json:"remote_head"`
+	Ahead          int    `json:"ahead"`
+	Behind         int    `json:"behind"`
+	LastSuccess    string `json:"last_success"`
+	Error          string `json:"error"`
+	Remote         string `json:"remote"`
+	RemoteIdentity string `json:"remote_identity"`
+	Branch         string `json:"branch"`
+	UpdatedAt      string `json:"updated_at"`
 }
 
 type syncRepo struct {
-	cfg    RepoConfig
-	gitDir string
+	cfg            RepoConfig
+	gitDir         string
+	remoteIdentity string
 }
 
 func openSyncRepo(cfg RepoConfig) (syncRepo, error) {
@@ -151,6 +154,13 @@ func (r *syncRepo) validate() error {
 	if _, err = r.git("remote", "get-url", remote); err != nil {
 		return errors.New("expected remote is not configured")
 	}
+	fetchURL, fetchErr := r.git("remote", "get-url", "--all", remote)
+	pushURL, pushErr := r.git("remote", "get-url", "--push", "--all", remote)
+	if fetchErr != nil || pushErr != nil || fetchURL == "" || strings.Contains(fetchURL, "\n") || strings.Contains(pushURL, "\n") || fetchURL != pushURL {
+		return errors.New("sync requires one identical fetch and push URL; configure authentication on that target")
+	}
+	// URLs may contain credentials: persist only a fingerprint, never the URL.
+	r.remoteIdentity = fmt.Sprintf("%x", sha256.Sum256([]byte(fetchURL)))
 	if r.cfg.Strategy == "" {
 		r.cfg.Strategy = "merge"
 	}
@@ -171,7 +181,7 @@ func (r syncRepo) inProgress() bool {
 }
 
 func (r syncRepo) inspect(previous SyncResult) SyncResult {
-	result := SyncResult{State: "pending", LastSuccess: previous.LastSuccess, Remote: r.cfg.Remote, Branch: r.cfg.Branch, UpdatedAt: previous.UpdatedAt}
+	result := SyncResult{State: "pending", LastSuccess: previous.LastSuccess, Remote: r.cfg.Remote, RemoteIdentity: r.remoteIdentity, Branch: r.cfg.Branch, UpdatedAt: previous.UpdatedAt}
 	result.Head, _ = r.git("rev-parse", "--verify", "HEAD")
 	result.RemoteHead, _ = r.git("rev-parse", "--verify", "refs/remotes/"+r.cfg.Remote+"/"+r.cfg.Branch)
 	if result.Head != "" && result.RemoteHead != "" {
@@ -197,7 +207,7 @@ func (r syncRepo) inspect(previous SyncResult) SyncResult {
 		result.State = previous.State
 		result.Error = previous.Error
 	}
-	if dirt != "" || result.Ahead != 0 || result.Behind != 0 || result.Head != previous.Head || result.RemoteHead != previous.RemoteHead || result.Remote != previous.Remote || result.Branch != previous.Branch {
+	if dirt != "" || result.Ahead != 0 || result.Behind != 0 || result.Head != previous.Head || result.RemoteHead != previous.RemoteHead || result.Remote != previous.Remote || result.Branch != previous.Branch || result.RemoteIdentity != previous.RemoteIdentity {
 		if result.State != "conflict" && result.State != "error" {
 			result.State = "pending"
 		}

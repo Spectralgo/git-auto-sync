@@ -28,6 +28,10 @@ install this fork.
 Configure a Git identity, authentication and an upstream for an existing local
 branch first. Both the branch name and its configured upstream must match the
 expected remote and branch before any files are staged or committed.
+The remote must have one identical fetch and push URL. Separate endpoints are
+rejected before staging; use that target's Git/SSH authentication configuration.
+The durable status stores a hash of the URL, so changing a remote's destination
+invalidates the previous success without persisting credential-bearing URLs.
 
 ```sh
 git-auto-sync sync --repo '/path/to/notes' --remote origin --branch main --strategy merge --json

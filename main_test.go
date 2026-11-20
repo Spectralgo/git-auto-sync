@@ -352,6 +352,45 @@ func TestTerminatedSyncStopsRealGitHookBeforeReleasingLock(t *testing.T) {
 	}
 }
 
+func TestTerminatedSyncAllowsGitToCleanItsIndexLock(t *testing.T) {
+	_, a, _ := fixture(t)
+	started := filepath.Join(a, ".git", "filter-started")
+	filter := filepath.Join(a, ".git", "slow-filter")
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
+	if err := os.WriteFile(filter, []byte("#!/bin/sh\ntouch "+quote(started)+"\nsleep 30\ncat\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeNote(t, a, ".gitattributes", "filtered.md filter=slow\n")
+	runGit(t, a, "config", "filter.slow.clean", quote(filter))
+	writeNote(t, a, "filtered.md", "preserved note\n")
+	cmd := exec.Command(testCLI, "sync", "--repo", a, "--remote", "origin", "--branch", "main", "--timeout", "20s", "--json")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("clean filter did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("interrupted sync reported success")
+	}
+	if _, err := os.Stat(filepath.Join(a, ".git", "index.lock")); !os.IsNotExist(err) {
+		t.Fatal("cancellation left a native index.lock, preventing recovery")
+	}
+	runGit(t, a, "config", "filter.slow.clean", "cat")
+	syncRepo(t, a, true)
+}
+
 func TestTerminatedSyncAbortsMergeUsingFreshCleanupContext(t *testing.T) {
 	_, a, b := fixture(t)
 	writeNote(t, a, "from-a.md", "published a\n")
@@ -438,6 +477,30 @@ func TestStatusDoesNotReuseSuccessFromAnotherRemote(t *testing.T) {
 	runGit(t, a, "config", "branch.main.remote", "another")
 	if got := invoke(t, false, "status", "--repo", a, "--remote", "another", "--branch", "main", "--json"); got.State != "pending" {
 		t.Fatalf("success from old target reused: %+v", got)
+	}
+}
+
+func TestStatusInvalidatesSuccessWhenRemoteURLChanges(t *testing.T) {
+	_, a, _ := fixture(t)
+	syncRepo(t, a, true)
+	runGit(t, a, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "different.git"))
+	if got := invoke(t, false, "status", "--repo", a, "--remote", "origin", "--branch", "main", "--json"); got.State != "pending" {
+		t.Fatalf("reused success for a different endpoint: %+v", got)
+	}
+}
+
+func TestSyncRejectsDifferentFetchAndPushEndpointsBeforeCommit(t *testing.T) {
+	remote, a, _ := fixture(t)
+	other := filepath.Join(t.TempDir(), "other.git")
+	runGit(t, filepath.Dir(other), "clone", "--bare", remote, other)
+	runGit(t, a, "remote", "set-url", "--push", "origin", other)
+	original := runGit(t, a, "rev-parse", "HEAD")
+	writeNote(t, a, "must-not-publish.md", "pending finding\n")
+	if got := syncRepo(t, a, false); got.State != "error" {
+		t.Fatalf("accepted different publish endpoint: %+v", got)
+	}
+	if runGit(t, a, "rev-parse", "HEAD") != original {
+		t.Fatal("committed before rejecting ambiguous remote endpoints")
 	}
 }
 

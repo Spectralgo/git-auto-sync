@@ -88,3 +88,63 @@ func TestWatchLoopRetriesTransientFailureAndKeepsWatching(t *testing.T) {
 		t.Fatal("watching did not resume")
 	}
 }
+
+func TestWatchPollingHonorsPendingWriteDebounce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan bool, 1)
+	calls := make(chan struct{}, 20)
+	go runWatchLoop(ctx, RepoConfig{FSLag: 250 * time.Millisecond, PollInterval: 50 * time.Millisecond}, events, func(RepoConfig) error {
+		calls <- struct{}{}
+		return nil
+	})
+	select {
+	case <-calls:
+	case <-time.After(time.Second):
+		t.Fatal("initial sync missing")
+	}
+	events <- true
+	select {
+	case <-calls:
+		t.Fatal("remote poll bypassed pending write debounce")
+	case <-time.After(180 * time.Millisecond):
+	}
+	select {
+	case <-calls:
+	case <-time.After(time.Second):
+		t.Fatal("settled write never synchronized")
+	}
+}
+
+func TestWatchPollingHonorsWritesQueuedDuringSync(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan bool, 1)
+	started, release := make(chan struct{}), make(chan struct{})
+	calls := make(chan struct{}, 20)
+	first := true
+	go runWatchLoop(ctx, RepoConfig{FSLag: 250 * time.Millisecond, PollInterval: 20 * time.Millisecond}, events, func(RepoConfig) error {
+		if first {
+			first = false
+			close(started)
+			<-release
+		} else {
+			calls <- struct{}{}
+		}
+		return nil
+	})
+	<-started
+	events <- true
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	select {
+	case <-calls:
+		t.Fatal("poll bypassed write queued during previous sync")
+	case <-time.After(180 * time.Millisecond):
+	}
+	select {
+	case <-calls:
+	case <-time.After(time.Second):
+		t.Fatal("queued write did not synchronize after settling")
+	}
+}

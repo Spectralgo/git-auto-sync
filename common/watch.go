@@ -151,6 +151,21 @@ func runWatchLoop(ctx context.Context, cfg RepoConfig, events <-chan bool, syncF
 			backoff = time.Second
 		}
 	}
+	consumePendingWrites := func() bool {
+		pending := false
+		for {
+			select {
+			case _, ok := <-events:
+				if !ok {
+					events = nil
+					return pending
+				}
+				pending = true
+			default:
+				return pending
+			}
+		}
+	}
 	perform()
 	for {
 		select {
@@ -163,9 +178,19 @@ func runWatchLoop(ctx context.Context, cfg RepoConfig, events <-chan bool, syncF
 			}
 			schedule(lag)
 		case <-ticker.C:
-			perform()
+			// A remote poll must not bypass an active write debounce or a
+			// scheduled retry. That timer owns the next safe sync boundary.
+			if consumePendingWrites() {
+				schedule(lag)
+			} else if next == nil {
+				perform()
+			}
 		case <-next:
-			perform()
+			if consumePendingWrites() {
+				schedule(lag)
+			} else {
+				perform()
+			}
 		}
 	}
 }
