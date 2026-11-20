@@ -1,6 +1,7 @@
 package common
 
 import (
+	"errors"
 	"github.com/ztrue/tracerr"
 )
 
@@ -11,10 +12,10 @@ func push(repoConfig RepoConfig) error {
 	}
 
 	if bi.UpstreamBranch == "" || bi.UpstreamRemote == "" {
-		return nil
+		return errors.New("branch has no remote upstream")
 	}
 
-	_, err = GitCommand(repoConfig, []string{"push", bi.UpstreamRemote, bi.UpstreamBranch})
+	_, err = GitCommand(repoConfig, []string{"push", bi.UpstreamRemote, "HEAD:refs/heads/" + bi.UpstreamBranch})
 	if err != nil {
 		return tracerr.Wrap(err)
 	}
