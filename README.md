@@ -23,6 +23,12 @@ go build -trimpath -o bin/git-auto-sync-daemon ./daemon
 The package-manager instructions below refer to upstream releases and do not
 install this fork.
 
+Fork releases use the manually dispatched `Release reviewed build` workflow,
+which packages an existing reviewed tag and publishes only to this repository.
+It does not use upstream Snapcraft, Homebrew tap or Fury publishing accounts,
+and never replaces existing release assets. The initial Apple Silicon candidate
+is `v1.6.0-wazo.1`; its release includes `SHA256SUMS`.
+
 ## Reliable one-shot synchronization
 
 Configure a Git identity, authentication and an upstream for an existing local
